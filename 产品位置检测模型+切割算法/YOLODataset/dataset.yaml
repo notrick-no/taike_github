@@ -1,0 +1,7 @@
+path: \\?\C:\Users\Q\Desktop\taike\YOLODataset
+train: images/train
+val: images/val
+test: images/test
+
+names:
+    0: product
