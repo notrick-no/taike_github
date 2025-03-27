@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import threading
 import queue
+from typing import List, Tuple
 
 import numpy as np              # 数据处理的库numpy
 import cv2                      # 图像处理的库OpenCv
@@ -15,6 +16,10 @@ import torch
 import torch.backends.cudnn as cudnn
 import torch.hub
 import traceback
+from wxpython.model_interface import Model1, Model2, DetectionResult  # 导入模型类
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_wxagg import FigureCanvasWxAgg as FigureCanvas
+import matplotlib.pyplot as plt
 
 
 class VideoCanvas(wx.Panel):
@@ -67,6 +72,45 @@ class VideoCanvas(wx.Panel):
         self.buffer = wx.Bitmap(*self.GetClientSize())
         self.Refresh()
         event.Skip()
+
+
+class HeatmapPanel(wx.Panel):
+    """热力图显示面板"""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.figure = Figure(figsize=(3, 2))
+        self.canvas = FigureCanvas(self, -1, self.figure)
+        self.ax = self.figure.add_subplot(111)
+        self.im = None
+        
+        # 设置布局
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        sizer.Add(self.canvas, 1, wx.EXPAND)
+        self.SetSizer(sizer)
+        
+    def update_heatmap(self, heatmap_data):
+        """更新热力图显示
+        
+        Args:
+            heatmap_data (np.ndarray): 6x9的热力图数据
+        """
+        if heatmap_data is None:
+            return
+            
+        # 清除当前图像
+        self.ax.clear()
+        
+        # 绘制热力图
+        self.im = self.ax.imshow(heatmap_data, cmap='hot', aspect='auto')
+        self.figure.colorbar(self.im, ax=self.ax)
+        
+        # 设置标题和标签
+        self.ax.set_title('缺陷分布热力图')
+        self.ax.set_xlabel('X轴')
+        self.ax.set_ylabel('Y轴')
+        
+        # 更新画布
+        self.canvas.draw()
 
 
 class DefectDetectorFrame(wx.Frame):
@@ -193,10 +237,14 @@ class DefectDetectorFrame(wx.Frame):
         status_sizer.Add(self.lbl_current_type, 0, wx.EXPAND | wx.BOTTOM, 10)
         status_sizer.Add(self.log_output, 1, wx.EXPAND)
 
-        # 整合所有区块到右侧面板
-        control_sizer.Add(device_sizer, 3, wx.EXPAND | wx.ALL, 5)  # 设备控制占3份高度
-        control_sizer.Add(param_sizer, 2, wx.EXPAND | wx.ALL, 5)  # 参数设置占2份
-        control_sizer.Add(status_sizer, 5, wx.EXPAND | wx.ALL, 5)  # 状态输出占5份
+        # 添加热力图显示面板
+        self.heatmap_panel = HeatmapPanel(control_panel)
+        
+        # 修改控制面板布局
+        control_sizer.Add(device_sizer, 2, wx.EXPAND | wx.ALL, 5)
+        control_sizer.Add(param_sizer, 1, wx.EXPAND | wx.ALL, 5)
+        control_sizer.Add(status_sizer, 3, wx.EXPAND | wx.ALL, 5)
+        control_sizer.Add(self.heatmap_panel, 2, wx.EXPAND | wx.ALL, 5)  # 添加热力图面板
         control_panel.SetSizer(control_sizer)
 
         main_sizer.Add(control_panel, 3, wx.EXPAND)
@@ -231,6 +279,35 @@ class DefectDetectorFrame(wx.Frame):
         # 状态跟踪
         self.total_defects = 0  # 累计缺陷数量
         self.current_defect = None  # 当前检测到的缺陷类型
+
+        # 初始化模型
+        self.model1 = Model1(min_confidence=0.5)
+        self.model2 = Model2(num_classes=6, heatmap_size=(6, 9))
+        
+        # 添加模型状态变量
+        self.current_detections = []  # 当前帧的检测结果
+        self.current_heatmap = None   # 当前热力图
+        self.defect_counts = [0] * 6  # 各类缺陷计数
+        
+        # 添加模型相关参数
+        self.slice_size = (6, 9)  # 切片尺寸
+        self.defect_colors = {
+            0: (0, 255, 0),    # 正常-绿色
+            1: (0, 0, 255),    # 缺陷1-红色
+            2: (255, 0, 0),    # 缺陷2-蓝色
+            3: (0, 255, 255),  # 缺陷3-青色
+            4: (255, 255, 0),  # 缺陷4-黄色
+            5: (255, 0, 255)   # 缺陷5-紫色
+        }
+
+        # 添加热力图相关参数
+        self.heatmap_update_interval = 0.5  # 热力图更新间隔（秒）
+        self.last_heatmap_update = 0
+        
+        # 热力图颜色映射
+        self.heatmap_cmap = plt.cm.hot
+        self.heatmap_vmin = 0
+        self.heatmap_vmax = 1
 
     # ---------------------------
     # 事件处理函数（伪代码示例）
@@ -279,12 +356,19 @@ class DefectDetectorFrame(wx.Frame):
                 if frame is None:
                     break
 
-                # 创建副本帧用于绘制锚框
+                # 创建副本帧用于绘制
                 overlay_frame = frame.copy()
 
-                # 在副本帧上绘制锚框
+                # 绘制边界框
                 for box, label, color in boxes:
-                    overlay_frame = draw_defect_rect(overlay_frame, box, label, color)
+                    x1, y1, x2, y2 = map(int, box)
+                    cv2.rectangle(overlay_frame, (x1, y1), (x2, y2), color, 2)
+                    
+                    # 添加标签
+                    label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+                    cv2.rectangle(overlay_frame, (x1, y1 - 20), (x1 + label_size[0], y1), color, -1)
+                    cv2.putText(overlay_frame, label, (x1, y1 - 5), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
 
                 # 在主线程中更新UI
                 wx.CallAfter(self.show_frame, overlay_frame)
@@ -297,47 +381,112 @@ class DefectDetectorFrame(wx.Frame):
     def _process_detection_result(self, result):
         """处理检测结果，添加红色大框、蓝色小框，并控制渲染持续不短于1秒"""
         try:
-            import random
-            import time
+            if result is None or 'frame' not in result:
+                print("警告：接收到无效的检测结果")
+                return
 
-            # 初始化最后一次框处理时间和缓存框架
-            if not hasattr(self, "_last_detection_time"):
-                self._last_detection_time = 0
-                self._cached_boxes = []  # 缓存红色大框和蓝色小框
-                self._cached_frame = None
-
-            # 判断时间间隔是否满足1秒展示需求
-            current_time = time.time()
-            if current_time - self._last_detection_time >= 3:  # 每3秒生成新框数据
-                self._last_detection_time = current_time
-
-            # 使用Module1检测并获取锚框位置
-            if not hasattr(self, 'module1'):
-                from model_interface import Module1
-                self.module1 = Module1()
-
-            # 调用detect_and_crop方法获取锚框
-            boxes, _ = self.module1.detect_and_crop(result['frame'])
-
-            # 转换为与当前代码兼容的格式
-            self._cached_boxes = []
-            for box in boxes:
-                x1, y1, x2, y2, confidence = box
-                self._cached_boxes.append(((x1, y1, x2, y2), f"Part {confidence:.2f}", (0, 0, 255)))
-
-            # 更新当前帧
-            self._cached_frame = result['frame'].copy()
-
+            frame = result['frame']
+            
+            # 使用Model1检测零件
+            detections, cropped_images = self.model1.detect_and_crop(frame)
+            self.current_detections = detections
+            
+            # 处理每个检测到的零件
+            for i, (detection, cropped) in enumerate(zip(detections, cropped_images)):
+                if not detection.valid:
+                    continue
+                    
+                # 将零件区域切片
+                slices = self._slice_image(cropped)
+                
+                # 使用Model2进行缺陷分类
+                classification_result = self.model2.classify_slices(slices)
+                
+                # 更新缺陷计数
+                for defect_type in classification_result['defect_types']:
+                    self.defect_counts[defect_type] += 1
+                
+                # 更新热力图
+                current_time = time.time()
+                if current_time - self.last_heatmap_update >= self.heatmap_update_interval:
+                    self.current_heatmap = classification_result['heatmap']
+                    wx.CallAfter(self.heatmap_panel.update_heatmap, self.current_heatmap)
+                    self.last_heatmap_update = current_time
+                
+                # 更新UI显示
+                wx.CallAfter(self._update_status_display)
+            
             # 将渲染任务放入队列
-            if self._cached_frame is not None:
-                self.render_queue.put((self._cached_frame.copy(), self._cached_boxes))
+            self.render_queue.put((frame.copy(), self._prepare_boxes(detections)))
 
-        except Exception as e:
-            print("处理检测渲染的逻辑出现异常:", e)
         except Exception as e:
             print(f"处理检测结果时出错：{str(e)}")
-            import traceback
             traceback.print_exc()
+
+    def _slice_image(self, image: np.ndarray) -> List[np.ndarray]:
+        """将图像均匀切割为6x9=54个切片
+        
+        Args:
+            image (np.ndarray): 输入图像
+            
+        Returns:
+            List[np.ndarray]: 54个切片图像列表
+        """
+        height, width = image.shape[:2]
+        slice_h = height // self.slice_size[0]
+        slice_w = width // self.slice_size[1]
+        
+        slices = []
+        for i in range(self.slice_size[0]):
+            for j in range(self.slice_size[1]):
+                y1 = i * slice_h
+                y2 = (i + 1) * slice_h
+                x1 = j * slice_w
+                x2 = (j + 1) * slice_w
+                slice_img = image[y1:y2, x1:x2].copy()
+                slices.append(slice_img)
+        
+        return slices
+
+    def _prepare_boxes(self, detections: List[DetectionResult]) -> List[Tuple]:
+        """准备绘制边界框的数据
+        
+        Args:
+            detections (List[DetectionResult]): 检测结果列表
+            
+        Returns:
+            List[Tuple]: 包含(bbox, label, color)的列表
+        """
+        boxes = []
+        for det in detections:
+            if not det.valid:
+                continue
+                
+            # 根据置信度选择颜色
+            color = (0, 255, 0) if det.confidence >= 0.8 else (0, 165, 255)
+            label = f"Part {det.confidence:.2f}"
+            boxes.append((det.bbox, label, color))
+        
+        return boxes
+
+    def _update_status_display(self):
+        """更新状态显示"""
+        # 更新缺陷计数显示
+        total_defects = sum(self.defect_counts[1:])  # 不包括正常类别
+        self.lbl_defect_count.SetLabel(f"缺陷总数: {total_defects}")
+        
+        # 更新当前缺陷类型显示
+        if self.current_heatmap is not None:
+            max_defect = np.argmax(self.defect_counts[1:]) + 1
+            self.lbl_current_type.SetLabel(f"当前缺陷: 类型{max_defect}")
+            
+            # 添加热力图统计信息
+            heatmap_mean = np.mean(self.current_heatmap)
+            heatmap_max = np.max(self.current_heatmap)
+            self.log_output.AppendText(f"[热力图] 平均强度: {heatmap_mean:.2f}, 最大强度: {heatmap_max:.2f}\n")
+        
+        # 更新日志
+        self.log_output.AppendText(f"[系统] 检测到 {len(self.current_detections)} 个零件\n")
 
     def show_frame(self, frame):
         """显示视频帧"""
