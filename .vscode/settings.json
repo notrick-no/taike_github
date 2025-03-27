@@ -1,0 +1,16 @@
+{
+    "files.associations": {
+        "iostream": "cpp",
+        "cmath": "cpp",
+        "cstdio": "cpp",
+        "cstdlib": "cpp",
+        "ios": "cpp",
+        "istream": "cpp",
+        "ostream": "cpp",
+        "streambuf": "cpp",
+        "xiosbase": "cpp",
+        "xlocnum": "cpp",
+        "xtr1common": "cpp",
+        "xlocale": "cpp"
+    }
+}
